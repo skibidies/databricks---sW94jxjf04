@@ -1,47 +1,66 @@
 //! The CSV dialect from `rules.md`: comma separated, `\n` line endings, any
-//! field may be wrapped in double quotes (the quotes are syntax), no value ever
-//! holds a comma, a quote or a newline, an empty field is null, and spaces are
-//! part of a value. A line with the wrong shape is malformed; the caller drops
-//! it.
+//! field may be wrapped in double quotes (the quotes are syntax and are not
+//! part of the value), no value ever holds a comma, a quote or a newline, an
+//! empty field is null, and spaces are part of a value. A line with the wrong
+//! shape is malformed; the caller drops it.
 
-/// Splits `line` into fields. Returns false when the line is malformed: an
-/// empty line, or a quote anywhere except around a whole field.
+/// Splits `line` into exactly `N` fields, or returns None when the line is
+/// malformed: empty, the wrong number of fields, or a quote anywhere except
+/// around a whole field.
 ///
 /// `line` must not include its `\n`. A `\r` is an ordinary character and stays
-/// in the field it lands in. One pass: commas and quotes are counted as the
-/// field is scanned.
-pub fn split_fields<'a>(line: &'a [u8], out: &mut Vec<&'a [u8]>) -> bool {
-    out.clear();
+/// in the field it lands in. One SIMD pass finds every comma and quote, so a
+/// bare field costs no scanning of its own.
+pub fn split_fields_n<'a, const N: usize>(line: &'a [u8]) -> Option<[&'a [u8]; N]> {
     if line.is_empty() {
-        return false;
+        return None;
     }
-    let mut start = 0;
-    let mut at = 0;
-    loop {
-        let mut quotes = 0u32;
-        while at < line.len() && line[at] != b',' {
-            if line[at] == b'"' {
-                quotes += 1;
+    let mut out: [&'a [u8]; N] = [&[]; N];
+    let mut n = 0usize;
+    let mut start = 0usize;
+    let mut first_quote = usize::MAX;
+    let mut quotes = 0u32;
+    for at in memchr::memchr2_iter(b',', b'"', line) {
+        if line[at] == b',' {
+            if n + 1 >= N {
+                return None; // more fields than the caller asked for
             }
-            at += 1;
-        }
-        let field = &line[start..at];
-        match quotes {
-            // Bare: the value is the field.
-            0 => out.push(field),
-            // Quoted: the quotes wrap the whole field and there are no others.
-            2 if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' => {
-                out.push(&field[1..field.len() - 1]);
+            out[n] = field_value(line, start, at, first_quote, quotes)?;
+            n += 1;
+            start = at + 1;
+            first_quote = usize::MAX;
+            quotes = 0;
+        } else {
+            if quotes == 0 {
+                first_quote = at;
             }
-            _ => return false,
+            quotes += 1;
         }
-        if at >= line.len() {
-            break;
-        }
-        at += 1; // the comma
-        start = at;
     }
-    true
+    if n + 1 != N {
+        return None;
+    }
+    out[n] = field_value(line, start, line.len(), first_quote, quotes)?;
+    Some(out)
+}
+
+/// A field's value: a bare field is itself, a quoted field loses its wrapping
+/// quotes. Any other shape of quote usage makes the line malformed.
+#[inline]
+fn field_value<'a>(
+    line: &'a [u8],
+    start: usize,
+    end: usize,
+    first_quote: usize,
+    quotes: u32,
+) -> Option<&'a [u8]> {
+    match quotes {
+        0 => Some(&line[start..end]),
+        2 if first_quote == start && end - start >= 2 && line[end - 1] == b'"' => {
+            Some(&line[start + 1..end - 1])
+        }
+        _ => None,
+    }
 }
 
 /// Splits a file body into chunks that end on a line boundary, for parallel

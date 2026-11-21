@@ -12,6 +12,7 @@ mod strmap;
 mod time;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -45,24 +46,22 @@ struct EvRow {
     flags: u8, // bit 0: product_id is not empty
 }
 
-/// A line parsed off its chunk, waiting for its turn at the shared maps.
-struct Pending<'a> {
-    id: &'a [u8],
-    user: &'a [u8],
-    ts: Option<i64>,
-    ingest: Option<i64>,
-    price: i64,
-    cat: u32,
-    kind: u8,
-    flags: u8,
-}
+/// The scatter target for a parallel fill. Each thread writes only the
+/// distinct positions that `fetch_add` hands out of `cursor`, so no two of
+/// them ever touch the same element.
+struct OutPtr<T>(*mut T);
+unsafe impl<T: Send> Send for OutPtr<T> {}
+unsafe impl<T: Send> Sync for OutPtr<T> {}
 
-/// A parsed click line, waiting for its turn at the shared maps.
-struct ClickPending<'a> {
-    id: &'a [u8],
-    user: &'a [u8],
-    ts: Option<i64>,
-    campaign: u32,
+impl<T> OutPtr<T> {
+    /// Writes the element at `at`.
+    ///
+    /// # Safety
+    /// `at` must be inside the allocation and written by no other call.
+    #[inline]
+    unsafe fn put(&self, at: usize, value: T) {
+        self.0.add(at).write(value);
+    }
 }
 
 /// A parsed click line, as the click_id dedup keeps it.
@@ -218,12 +217,16 @@ fn main() {
 
     // ---- surviving events, grouped by person and sorted by ts -------------
 
-    let mut ev_count = vec![0usize; n_users];
-    ev_map.for_each_value(|row| {
+    let ev_counts: Vec<AtomicUsize> = (0..n_users).map(|_| AtomicUsize::new(0)).collect();
+    ev_map.par_for_each_value(|row| {
         if event_survives(&row, win_start, win_end) {
-            ev_count[parent[row.user as usize] as usize] += 1;
+            ev_counts[parent[row.user as usize] as usize].fetch_add(1, Ordering::Relaxed);
         }
     });
+    let mut ev_count = vec![0usize; n_users];
+    for (at, count) in ev_count.iter_mut().zip(ev_counts.iter()) {
+        *at = count.load(Ordering::Relaxed);
+    }
     let mut ev_at = vec![0usize; n_users];
     let mut total = 0usize;
     for p in 0..n_users {
@@ -231,20 +234,28 @@ fn main() {
         total += ev_count[p];
     }
     let mut ev_sorted = vec![Ev2 { ts: 0, price: 0, cat: 0, kind: 0 }; total];
-    let mut cursor = ev_at.clone();
     // The map is emptied as it is read, so its memory never stacks up with the
-    // events it produced.
-    ev_map.drain_values(|row| {
+    // events it produced. Every surviving row takes one distinct position out
+    // of `cursor`, which is what makes the parallel fill safe.
+    let cursor: Vec<AtomicUsize> = ev_at.iter().map(|&at| AtomicUsize::new(at)).collect();
+    let scatter = OutPtr(ev_sorted.as_mut_ptr());
+    ev_map.par_drain_values(|row| {
         if event_survives(&row, win_start, win_end) {
             let person = parent[row.user as usize] as usize;
-            let at = cursor[person];
-            cursor[person] += 1;
-            ev_sorted[at] = Ev2 {
-                ts: row.ts,
-                price: row.price,
-                cat: row.cat,
-                kind: row.kind,
-            };
+            let at = cursor[person].fetch_add(1, Ordering::Relaxed);
+            // SAFETY: `at` is handed out once, so no other thread writes this
+            // element.
+            unsafe {
+                scatter.put(
+                    at,
+                    Ev2 {
+                        ts: row.ts,
+                        price: row.price,
+                        cat: row.cat,
+                        kind: row.kind,
+                    },
+                );
+            }
         }
     });
     drop(cursor);
@@ -271,12 +282,16 @@ fn main() {
     // ---- surviving clicks, grouped by person and sorted by ts -------------
 
     let mut ck_ids: Vec<u8> = Vec::new();
-    let mut ck_count = vec![0usize; n_users];
-    ck_map.for_each_value(|row| {
+    let ck_counts: Vec<AtomicUsize> = (0..n_users).map(|_| AtomicUsize::new(0)).collect();
+    ck_map.par_for_each_value(|row| {
         if click_survives(&row, win_start, win_end) {
-            ck_count[parent[row.user as usize] as usize] += 1;
+            ck_counts[parent[row.user as usize] as usize].fetch_add(1, Ordering::Relaxed);
         }
     });
+    let mut ck_count = vec![0usize; n_users];
+    for (at, count) in ck_count.iter_mut().zip(ck_counts.iter()) {
+        *at = count.load(Ordering::Relaxed);
+    }
     let mut ck_at = vec![0usize; n_users];
     let mut total = 0usize;
     for p in 0..n_users {
@@ -680,12 +695,11 @@ fn read_catalog(data: &Path) -> Catalog {
     let mut product_cat = ByteMap::new();
     if let Ok(bytes) = std::fs::read(data.join("products.csv")) {
         let body = csv::body_after_header(&bytes);
-        let mut fields: Vec<&[u8]> = Vec::with_capacity(4);
         for line in body.split(|&b| b == b'\n') {
-            if !csv::split_fields(line, &mut fields) || fields.len() != 2 {
+            let Some(f) = csv::split_fields_n::<2>(line) else {
                 continue;
-            }
-            let (product, category) = (fields[0], fields[1]);
+            };
+            let (product, category) = (f[0], f[1]);
             if product.is_empty() {
                 continue;
             }
@@ -713,12 +727,11 @@ fn read_catalog(data: &Path) -> Catalog {
     let mut campaign_channels: Vec<Box<[u8]>> = Vec::new();
     if let Ok(bytes) = std::fs::read(data.join("campaigns.csv")) {
         let body = csv::body_after_header(&bytes);
-        let mut fields: Vec<&[u8]> = Vec::with_capacity(4);
         for line in body.split(|&b| b == b'\n') {
-            if !csv::split_fields(line, &mut fields) || fields.len() != 2 {
+            let Some(f) = csv::split_fields_n::<2>(line) else {
                 continue;
-            }
-            let (campaign, channel) = (fields[0], fields[1]);
+            };
+            let (campaign, channel) = (f[0], f[1]);
             if campaign.is_empty() || campaign_index.get(campaign).is_some() {
                 continue;
             }
@@ -774,76 +787,90 @@ fn parse_events(data: &Path, catalog: &Catalog, users: &StrMap<u32>, events: &St
             };
             let body = csv::body_after_header(&bytes);
             csv::chunks(body, CHUNK).par_iter().for_each(|chunk| {
-                let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
-                let mut pending: Vec<Pending> = Vec::with_capacity(BATCH);
-                for line in chunk.split(|&b| b == b'\n') {
-                    if !csv::split_fields(line, &mut fields) || fields.len() != 7 {
+                let mut batch = EvBatch::with_capacity(BATCH);
+                let mut rest = *chunk;
+                while !rest.is_empty() {
+                    let (line, tail) = match memchr::memchr(b'\n', rest) {
+                        Some(at) => (&rest[..at], &rest[at + 1..]),
+                        None => (rest, &rest[rest.len()..]),
+                    };
+                    rest = tail;
+                    let Some(f) = csv::split_fields_n::<7>(line) else {
                         continue;
-                    }
-                    let id = fields[0];
+                    };
+                    let id = f[0];
                     if id.is_empty() {
                         continue;
                     }
-                    let (kind, price) = match fields[4] {
+                    let (kind, price) = match f[4] {
                         b"view" => (0u8, -1i64),
                         b"cart" => (1, -1),
-                        b"purchase" => (2, parse_price(fields[6])),
+                        b"purchase" => (2, parse_price(f[6])),
                         _ => (255, -1),
                     };
-                    let product = fields[5];
-                    let flags = if product.is_empty() { 0u8 } else { 1 };
-                    pending.push(Pending {
-                        id,
-                        user: fields[1],
-                        ts: time::parse_timestamp(fields[2]),
-                        ingest: time::parse_f1(fields[3]),
+                    // Only purchases ever report a category, so only they pay
+                    // for the product lookup.
+                    let cat = if kind == 2 {
+                        catalog.product_cat.get(f[5]).unwrap_or(catalog.unknown)
+                    } else {
+                        catalog.unknown
+                    };
+                    batch.rows.push(EvRow {
+                        ts: time::parse_timestamp(f[2]).unwrap_or(i64::MIN),
+                        ingest: time::parse_f1(f[3]).unwrap_or(i64::MAX),
                         price,
-                        cat: catalog.product_cat.get(product).unwrap_or(catalog.unknown),
+                        user: NO_USER,
+                        cat,
                         kind,
-                        flags,
+                        flags: if f[5].is_empty() { 0 } else { 1 },
                     });
-                    if pending.len() >= BATCH {
-                        flush_events(&pending, users, events);
-                        pending.clear();
+                    batch.users.push(f[1]);
+                    batch.ids.push(id);
+                    if batch.rows.len() >= BATCH {
+                        batch.flush(users, events);
                     }
                 }
-                if !pending.is_empty() {
-                    flush_events(&pending, users, events);
-                }
+                batch.flush(users, events);
             });
         });
     }
 }
 
-/// Interns the batch's users, then hands the batch to the event_id dedup,
-/// which keeps the smallest ingest_ts. Dedup comes before validation.
-fn flush_events(pending: &[Pending], users: &StrMap<u32>, events: &StrMap<EvRow>) {
-    let keys: Vec<&[u8]> = pending.iter().map(|p| p.user).collect();
-    let mut ids = vec![0u32; keys.len()];
-    users.intern_batch(&keys, &mut ids);
-    let rows: Vec<(&[u8], EvRow)> = pending
-        .iter()
-        .zip(ids.iter())
-        .map(|(p, &user)| {
-            (
-                p.id,
-                EvRow {
-                    ts: p.ts.unwrap_or(i64::MIN),
-                    ingest: p.ingest.unwrap_or(i64::MAX),
-                    price: p.price,
-                    user: if p.user.is_empty() { NO_USER } else { user },
-                    cat: p.cat,
-                    kind: p.kind,
-                    flags: p.flags,
-                },
-            )
-        })
-        .collect();
-    events.upsert_batch(&rows, &|kept, new| {
-        if new.ingest < kept.ingest {
-            *kept = new;
+/// One chunk's events: the rows as parsed, with the id and user strings they
+/// came from still pointing into the chunk. The batch goes to the shared maps
+/// in one go, so a chunk takes one lock per shard rather than one per row.
+struct EvBatch<'a> {
+    rows: Vec<EvRow>,
+    users: Vec<&'a [u8]>,
+    ids: Vec<&'a [u8]>,
+}
+
+impl<'a> EvBatch<'a> {
+    fn with_capacity(n: usize) -> Self {
+        EvBatch {
+            rows: Vec::with_capacity(n),
+            users: Vec::with_capacity(n),
+            ids: Vec::with_capacity(n),
         }
-    });
+    }
+
+    /// Interns the batch's users, then hands the batch to the event_id dedup,
+    /// which keeps the smallest ingest_ts. Dedup comes before validation.
+    fn flush(&mut self, users: &StrMap<u32>, events: &StrMap<EvRow>) {
+        let mut ids = vec![0u32; self.users.len()];
+        users.intern_batch(&self.users, &mut ids);
+        for ((row, &user), &key) in self.rows.iter_mut().zip(ids.iter()).zip(self.users.iter()) {
+            row.user = if key.is_empty() { NO_USER } else { user };
+        }
+        events.upsert_batch(&self.ids, &self.rows, &|kept, new| {
+            if new.ingest < kept.ingest {
+                *kept = new;
+            }
+        });
+        self.rows.clear();
+        self.users.clear();
+        self.ids.clear();
+    }
 }
 
 fn parse_clicks(data: &Path, catalog: &Catalog, users: &StrMap<u32>, clicks: &StrMap<CkRow>) {
@@ -858,59 +885,71 @@ fn parse_clicks(data: &Path, catalog: &Catalog, users: &StrMap<u32>, clicks: &St
             };
             let body = csv::body_after_header(&bytes);
             csv::chunks(body, CHUNK).par_iter().for_each(|chunk| {
-                let mut fields: Vec<&[u8]> = Vec::with_capacity(4);
-                let mut pending: Vec<ClickPending> = Vec::with_capacity(BATCH);
-                for line in chunk.split(|&b| b == b'\n') {
-                    if !csv::split_fields(line, &mut fields) || fields.len() != 4 {
+                let mut batch = CkBatch::with_capacity(BATCH);
+                let mut rest = *chunk;
+                while !rest.is_empty() {
+                    let (line, tail) = match memchr::memchr(b'\n', rest) {
+                        Some(at) => (&rest[..at], &rest[at + 1..]),
+                        None => (rest, &rest[rest.len()..]),
+                    };
+                    rest = tail;
+                    let Some(f) = csv::split_fields_n::<4>(line) else {
                         continue;
-                    }
-                    let id = fields[0];
+                    };
+                    let id = f[0];
                     if id.is_empty() {
                         continue;
                     }
-                    pending.push(ClickPending {
-                        id,
-                        user: fields[1],
-                        ts: time::parse_timestamp(fields[3]),
-                        campaign: match catalog.campaign_index.get(fields[2]) {
+                    batch.rows.push(CkRow {
+                        ts: time::parse_timestamp(f[3]).unwrap_or(i64::MIN),
+                        user: NO_USER,
+                        campaign: match catalog.campaign_index.get(f[2]) {
                             Some(id) => id,
                             None => NO_CAMPAIGN,
                         },
                     });
-                    if pending.len() >= BATCH {
-                        flush_clicks(&pending, users, clicks);
-                        pending.clear();
+                    batch.users.push(f[1]);
+                    batch.ids.push(id);
+                    if batch.rows.len() >= BATCH {
+                        batch.flush(users, clicks);
                     }
                 }
-                if !pending.is_empty() {
-                    flush_clicks(&pending, users, clicks);
-                }
+                batch.flush(users, clicks);
             });
         });
     }
 }
 
-/// Interns the batch's users, then hands the batch to the click_id dedup.
-/// Copies of a click hold identical values, so keeping the first is enough.
-fn flush_clicks(pending: &[ClickPending], users: &StrMap<u32>, clicks: &StrMap<CkRow>) {
-    let keys: Vec<&[u8]> = pending.iter().map(|p| p.user).collect();
-    let mut ids = vec![0u32; keys.len()];
-    users.intern_batch(&keys, &mut ids);
-    let rows: Vec<(&[u8], CkRow)> = pending
-        .iter()
-        .zip(ids.iter())
-        .map(|(p, &user)| {
-            (
-                p.id,
-                CkRow {
-                    ts: p.ts.unwrap_or(i64::MIN),
-                    user: if p.user.is_empty() { NO_USER } else { user },
-                    campaign: p.campaign,
-                },
-            )
-        })
-        .collect();
-    clicks.upsert_batch(&rows, &|_, _| {});
+/// One chunk's clicks: the rows as parsed, with the id and user strings they
+/// came from still pointing into the chunk.
+struct CkBatch<'a> {
+    rows: Vec<CkRow>,
+    users: Vec<&'a [u8]>,
+    ids: Vec<&'a [u8]>,
+}
+
+impl<'a> CkBatch<'a> {
+    fn with_capacity(n: usize) -> Self {
+        CkBatch {
+            rows: Vec::with_capacity(n),
+            users: Vec::with_capacity(n),
+            ids: Vec::with_capacity(n),
+        }
+    }
+
+    /// Interns the batch's users, then hands the batch to the click_id dedup.
+    /// Copies of a click hold identical values, so keeping the first is enough.
+    fn flush(&mut self, users: &StrMap<u32>, clicks: &StrMap<CkRow>) {
+        let mut ids = vec![0u32; self.users.len()];
+        users.intern_batch(&self.users, &mut ids);
+        for ((row, &user), &key) in self.rows.iter_mut().zip(ids.iter()).zip(self.users.iter()) {
+            row.user = if key.is_empty() { NO_USER } else { user };
+        }
+        clicks.upsert_batch(&self.ids, &self.rows, &|_, _| {});
+        self.rows.clear();
+        self.users.clear();
+        self.ids.clear();
+    }
 }
 
 fn total_size(files: &[PathBuf]) -> usize {
@@ -932,12 +971,11 @@ fn parse_links(data: &Path, users: &StrMap<u32>) -> Vec<(u32, u32)> {
             };
             let body = csv::body_after_header(&bytes);
             for chunk in csv::chunks(body, CHUNK) {
-                let mut fields: Vec<&[u8]> = Vec::with_capacity(4);
                 for line in chunk.split(|&b| b == b'\n') {
-                    if !csv::split_fields(line, &mut fields) || fields.len() != 2 {
+                    let Some(f) = csv::split_fields_n::<2>(line) else {
                         continue;
-                    }
-                    let (a, b) = (fields[0], fields[1]);
+                    };
+                    let (a, b) = (f[0], f[1]);
                     if a.is_empty() || b.is_empty() {
                         continue;
                     }

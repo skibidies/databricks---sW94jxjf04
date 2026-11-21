@@ -9,6 +9,7 @@ name = "pipeline"
 path = "src/main.rs"
 
 [dependencies]
+memchr = "2"
 parquet = { version = "56", default-features = false, features = ["snap"] }
 rayon = "1"
 

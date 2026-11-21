@@ -116,11 +116,13 @@ impl<V: Copy> StrMap<V> {
         }
     }
 
-    /// `upsert` for a whole batch, taking each shard's lock once.
-    pub fn upsert_batch(&self, items: &[(&[u8], V)], merge: &impl Fn(&mut V, V)) {
-        let mut hashes: Vec<u64> = Vec::with_capacity(items.len());
+    /// `upsert` for a whole batch, taking each shard's lock once. `keys` and
+    /// `vals` hold one entry each, in the same order.
+    pub fn upsert_batch(&self, keys: &[&[u8]], vals: &[V], merge: &impl Fn(&mut V, V)) {
+        debug_assert_eq!(keys.len(), vals.len());
+        let mut hashes: Vec<u64> = Vec::with_capacity(keys.len());
         let mut buckets: Vec<Vec<u32>> = (0..SHARDS).map(|_| Vec::new()).collect();
-        for (index, (key, _)) in items.iter().enumerate() {
+        for (index, key) in keys.iter().enumerate() {
             let h = hash_bytes(key);
             hashes.push(h);
             buckets[(h as usize) & (SHARDS - 1)].push(index as u32);
@@ -131,25 +133,35 @@ impl<V: Copy> StrMap<V> {
             }
             let mut shard = self.shards[s].lock().unwrap();
             for index in bucket {
-                let (key, new) = items[index as usize];
-                shard.upsert_hashed(hashes[index as usize], key, new, merge);
+                let index = index as usize;
+                shard.upsert_hashed(hashes[index], keys[index], vals[index], merge);
             }
         }
     }
 
-    /// Calls `each` with every value, in an unspecified order.
-    pub fn for_each_value<F: FnMut(V)>(&self, mut each: F) {
-        for shard in &self.shards {
+    /// `for_each_value` in parallel over the shards, so the walk is never a
+    /// serial pass over the whole map.
+    pub fn par_for_each_value<F: Fn(V) + Sync + Send>(&self, each: F)
+    where
+        V: Send,
+    {
+        use rayon::prelude::*;
+        self.shards.par_iter().for_each(|shard| {
             let shard = shard.lock().unwrap();
             for entry in &shard.entries {
                 each(entry.val);
             }
-        }
+        });
     }
 
-    /// Takes every value out of the map, freeing each shard as it is done with.
-    pub fn drain_values<F: FnMut(V)>(&self, mut each: F) {
-        for shard in &self.shards {
+    /// `drain_values` in parallel over the shards. `each` must be safe to call
+    /// from several threads at once.
+    pub fn par_drain_values<F: Fn(V) + Sync + Send>(&self, each: F)
+    where
+        V: Send,
+    {
+        use rayon::prelude::*;
+        self.shards.par_iter().for_each(|shard| {
             let mut shard = shard.lock().unwrap();
             let entries = std::mem::take(&mut shard.entries);
             shard.bytes = Vec::new();
@@ -157,7 +169,7 @@ impl<V: Copy> StrMap<V> {
             for entry in &entries {
                 each(entry.val);
             }
-        }
+        });
     }
 
     /// Copies every key and value out of the map, freeing each shard as it is
@@ -379,9 +391,13 @@ impl ByteMap {
             if slot == 0 {
                 return None;
             }
-            let (off, len, val) = self.entries[(slot & 0x01ff_ffff) as usize - 1];
-            if slot >> 25 == tag && bytes_eq(&self.bytes[off as usize..(off + len) as usize], key) {
-                return Some(val);
+            // The tag decides first: it skips the entry read for the 127 of
+            // 128 occupied slots that belong to some other key.
+            if slot >> 25 == tag {
+                let (off, len, val) = self.entries[(slot & 0x01ff_ffff) as usize - 1];
+                if bytes_eq(&self.bytes[off as usize..(off + len) as usize], key) {
+                    return Some(val);
+                }
             }
             at = (at + 1) & mask;
         }
