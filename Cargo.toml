@@ -1,0 +1,19 @@
+[package]
+name = "shopping-sessions"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+[dependencies]
+parquet = { version = "56", default-features = false, features = ["snap"] }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
