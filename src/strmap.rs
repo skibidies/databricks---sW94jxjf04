@@ -13,6 +13,19 @@ use std::sync::Mutex;
 
 const SHARDS: usize = 16;
 
+/// Every walk of the shards starts at a different one, so parallel workers
+/// never march through them in the same order and line up on the same lock.
+fn walk_start() -> usize {
+    thread_local! {
+        static START: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    START.with(|c| {
+        let at = c.get();
+        c.set(at.wrapping_add(5) & (SHARDS - 1));
+        at
+    })
+}
+
 /// FxHash with a finalizer: fast on short ids, good enough spread.
 fn hash_bytes(key: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
@@ -127,12 +140,15 @@ impl<V: Copy> StrMap<V> {
             hashes.push(h);
             buckets[(h as usize) & (SHARDS - 1)].push(index as u32);
         }
-        for (s, bucket) in buckets.into_iter().enumerate() {
+        let start = walk_start();
+        for i in 0..SHARDS {
+            let s = (start + i) & (SHARDS - 1);
+            let bucket = &buckets[s];
             if bucket.is_empty() {
                 continue;
             }
             let mut shard = self.shards[s].lock().unwrap();
-            for index in bucket {
+            for &index in bucket {
                 let index = index as usize;
                 shard.upsert_hashed(hashes[index], keys[index], vals[index], merge);
             }
@@ -212,12 +228,15 @@ impl<V: Copy + Hint> StrMap<V> {
             hashes.push(h);
             buckets[(h as usize) & (SHARDS - 1)].push(index as u32);
         }
-        for (s, bucket) in buckets.into_iter().enumerate() {
+        let start = walk_start();
+        for i in 0..SHARDS {
+            let s = (start + i) & (SHARDS - 1);
+            let bucket = &buckets[s];
             if bucket.is_empty() {
                 continue;
             }
             let mut shard = self.shards[s].lock().unwrap();
-            for index in bucket {
+            for &index in bucket {
                 let index = index as usize;
                 out[index] = shard.intern_hashed(hashes[index], keys[index], &self.next_id);
             }
