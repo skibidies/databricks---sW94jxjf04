@@ -12,6 +12,7 @@ path = "src/main.rs"
 memchr = "2"
 parquet = { version = "56", default-features = false, features = ["snap"] }
 rayon = "1"
+zstd = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = 3

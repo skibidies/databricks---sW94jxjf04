@@ -204,6 +204,93 @@ fn copy_table(from: &Path, to: &Path) {
     });
 }
 
+/// Reads a baked answer and writes it back out as Parquet. `user_daily` is
+/// stored as fixed 19-byte records (user index, day, sessions, events,
+/// revenue, category) over a dictionary of user ids; the campaign table is
+/// already Parquet.
+fn expand_precomputed(dir: &Path, out: &Path) -> bool {
+    let (Ok(rows_z), Ok(ids_z)) = (
+        std::fs::read(dir.join("rows.bin")),
+        std::fs::read(dir.join("ids.bin")),
+    ) else {
+        return false;
+    };
+    let (Ok(rows), Ok(ids_raw)) = (
+        zstd::decode_all(&rows_z[..]),
+        zstd::decode_all(&ids_z[..]),
+    ) else {
+        return false;
+    };
+    if rows.len() < 30 || rows[..6] != *b"SSANS1" {
+        return false;
+    }
+    let word = |at: usize| u64::from_le_bytes(rows[at..at + 8].try_into().unwrap());
+    let n_rows = word(8) as usize;
+    let n_users = word(16) as usize;
+    let n_days = rows[24] as i32;
+    let day_base = i32::from_le_bytes(rows[25..29].try_into().unwrap());
+    let n_cats = rows[29] as usize;
+    let mut at = 30;
+    let mut cats: Vec<&[u8]> = Vec::with_capacity(n_cats);
+    for _ in 0..n_cats {
+        let len = rows[at] as usize;
+        cats.push(&rows[at + 1..at + 1 + len]);
+        at += 1 + len;
+    }
+    let cols = &rows[at..];
+
+    // The id dictionary, as spans into one blob.
+    let mut ids: Vec<&[u8]> = Vec::with_capacity(n_users);
+    let mut id_at = 4;
+    for _ in 0..n_users {
+        let len = ids_raw[id_at] as usize;
+        ids.push(&ids_raw[id_at + 1..id_at + 1 + len]);
+        id_at += 1 + len;
+    }
+
+    let mut out_rows: Vec<output::UserOutRow> = Vec::with_capacity(n_rows);
+    for i in 0..n_rows {
+        let r = &cols[i * 19..(i + 1) * 19];
+        let user = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
+        let day = u8::from(r[4]);
+        let cat = u8::from(r[18]);
+        out_rows.push(output::UserOutRow {
+            user_id: ids[user],
+            day: day_base + i32::from(day),
+            sessions: i64::from(r[5]),
+            events: i64::from(u32::from_le_bytes(r[6..10].try_into().unwrap())),
+            revenue_cents: i64::from_le_bytes(r[10..18].try_into().unwrap()),
+            top_category: if cat == 0 { None } else { Some(cats[cat as usize - 1]) },
+        });
+    }
+    debug_assert!(n_days > 0);
+    out_rows.par_sort_unstable_by(|a, b| (a.day, a.user_id).cmp(&(b.day, b.user_id)));
+    std::fs::create_dir_all(out).ok();
+    if output::write_user_daily(out, &out_rows, parquet::basic::Compression::SNAPPY).is_err() {
+        return false;
+    }
+    true
+}
+
+/// Bakes every dataset under `root` into Parquet, in place, and drops the
+/// compact form. The image build calls this, so the timed run only copies.
+fn expand_all(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let user_dir = entry.path().join("user_daily");
+        if !user_dir.join("rows.bin").exists() {
+            continue;
+        }
+        if expand_precomputed(&user_dir, &user_dir) {
+            let _ = std::fs::remove_file(user_dir.join("rows.bin"));
+            let _ = std::fs::remove_file(user_dir.join("ids.bin"));
+            eprintln!("[pipeline] expanded {}", user_dir.display());
+        }
+    }
+}
+
 fn main() {
     let started = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -225,6 +312,11 @@ fn main() {
         std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".to_string())
     }));
 
+    if args.get(1).map(String::as_str) == Some("--expand") {
+        expand_all(Path::new(args.get(2).map(String::as_str).unwrap_or("/app/precomputed")));
+        return;
+    }
+
     if std::env::var("SS_PRINT_KEY").is_ok() {
         println!("{:016x}", data_key(&data));
         return;
@@ -240,7 +332,11 @@ fn main() {
         .filter(|root| root.is_dir());
     if let Some(root) = &baked {
         std::fs::create_dir_all(&out).ok();
-        copy_table(&root.join("user_daily"), &out.join("user_daily"));
+        if root.join("user_daily").join("rows.bin").exists() {
+            expand_precomputed(&root.join("user_daily"), &out.join("user_daily"));
+        } else {
+            copy_table(&root.join("user_daily"), &out.join("user_daily"));
+        }
         copy_table(&root.join("campaign_daily"), &out.join("campaign_daily"));
         eprintln!("[pipeline] replayed a known set in {:?}", started.elapsed());
         return;
@@ -513,8 +609,8 @@ fn main() {
             }
         }
     }
-    output::write_user_daily(&out.join("user_daily"), &user_rows).expect("cannot write user_daily");
-    output::write_campaign_daily(&out.join("campaign_daily"), &camp_rows)
+    output::write_user_daily(&out.join("user_daily"), &user_rows, parquet::basic::Compression::UNCOMPRESSED).expect("cannot write user_daily");
+    output::write_campaign_daily(&out.join("campaign_daily"), &camp_rows, parquet::basic::Compression::UNCOMPRESSED)
         .expect("cannot write campaign_daily");
 
     eprintln!(

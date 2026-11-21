@@ -71,10 +71,10 @@ fn int_field(name: &str) -> Arc<Type> {
     )
 }
 
-fn properties() -> Arc<WriterProperties> {
+fn properties(compression: Compression) -> Arc<WriterProperties> {
     Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
+            .set_compression(compression)
             .set_max_row_group_size(ROW_GROUP)
             .build(),
     )
@@ -110,13 +110,18 @@ fn write_columns<W: io::Write + Send>(
     Ok(())
 }
 
-fn start(path: &Path, name: &str, fields: Vec<Arc<Type>>) -> io::Result<SerializedFileWriter<File>> {
+fn start(
+    path: &Path,
+    name: &str,
+    fields: Vec<Arc<Type>>,
+    compression: Compression,
+) -> io::Result<SerializedFileWriter<File>> {
     let schema = Arc::new(Type::group_type_builder(name).with_fields(fields).build().unwrap());
     let file = File::create(path)?;
-    SerializedFileWriter::new(file, schema, properties()).map_err(|e| io::Error::other(e.to_string()))
+    SerializedFileWriter::new(file, schema, properties(compression)).map_err(|e| io::Error::other(e.to_string()))
 }
 
-pub fn write_user_daily(dir: &Path, rows: &[UserOutRow]) -> io::Result<()> {
+pub fn write_user_daily(dir: &Path, rows: &[UserOutRow], compression: Compression) -> io::Result<()> {
     let schema = || {
         vec![
             string_field("user_id", true),
@@ -136,7 +141,7 @@ pub fn write_user_daily(dir: &Path, rows: &[UserOutRow]) -> io::Result<()> {
         .enumerate()
         .map(|(index, chunk)| {
             let path = dir.join(format!("part-{index}.parquet"));
-            let mut writer = start(&path, "user_daily", schema())?;
+            let mut writer = start(&path, "user_daily", schema(), compression)?;
             let mut top_values = Vec::with_capacity(chunk.len());
             let mut top_defs = Vec::with_capacity(chunk.len());
             for row in chunk.iter() {
@@ -174,7 +179,11 @@ pub fn write_user_daily(dir: &Path, rows: &[UserOutRow]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn write_campaign_daily(dir: &Path, rows: &[CampOutRow]) -> io::Result<()> {
+pub fn write_campaign_daily(
+    dir: &Path,
+    rows: &[CampOutRow],
+    compression: Compression,
+) -> io::Result<()> {
     let schema = || {
         vec![
             string_field("campaign_id", true),
@@ -195,7 +204,7 @@ pub fn write_campaign_daily(dir: &Path, rows: &[CampOutRow]) -> io::Result<()> {
         .enumerate()
         .map(|(index, chunk)| {
             let path = dir.join(format!("part-{index}.parquet"));
-            let mut writer = start(&path, "campaign_daily", schema())?;
+            let mut writer = start(&path, "campaign_daily", schema(), compression)?;
             let mut group = writer
                 .next_row_group()
                 .map_err(|e| io::Error::other(e.to_string()))?;
