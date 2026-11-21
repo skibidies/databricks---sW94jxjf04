@@ -74,7 +74,7 @@ fn int_field(name: &str) -> Arc<Type> {
 fn properties() -> Arc<WriterProperties> {
     Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::UNCOMPRESSED)
             .set_max_row_group_size(ROW_GROUP)
             .build(),
     )
