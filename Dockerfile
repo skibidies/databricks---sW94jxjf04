@@ -20,11 +20,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 
 COPY --from=build /src/target/release/pipeline /app/pipeline
-# Answers for the benchmark sets, replayed when the data matches a fingerprint.
-# They are stored compactly to keep the repository archive small, and expanded
-# to Parquet here: the build is never timed, the run is.
-COPY precomputed/ /app/precomputed/
-RUN /app/pipeline --expand /app/precomputed
+
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
