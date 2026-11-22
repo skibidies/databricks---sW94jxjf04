@@ -18,48 +18,43 @@ pub fn split_fields_n<'a, const N: usize>(line: &'a [u8]) -> Option<[&'a [u8]; N
     let mut out: [&'a [u8]; N] = [&[]; N];
     let mut n = 0usize;
     let mut start = 0usize;
-    let mut first_quote = usize::MAX;
-    let mut quotes = 0u32;
-    for at in memchr::memchr2_iter(b',', b'"', line) {
-        if line[at] == b',' {
-            if n + 1 >= N {
-                return None; // more fields than the caller asked for
-            }
-            out[n] = field_value(line, start, at, first_quote, quotes)?;
-            n += 1;
-            start = at + 1;
-            first_quote = usize::MAX;
-            quotes = 0;
-        } else {
-            if quotes == 0 {
-                first_quote = at;
-            }
-            quotes += 1;
+    // A comma is always a delimiter - no value holds one, quoted or not - so
+    // one single-needle SIMD pass finds every boundary. Quotes only ever wrap
+    // a whole field and are checked at the edges below.
+    for at in memchr::memchr_iter(b',', line) {
+        if n + 1 >= N {
+            return None; // more fields than the caller asked for
         }
+        out[n] = field_value(&line[start..at])?;
+        n += 1;
+        start = at + 1;
     }
     if n + 1 != N {
         return None;
     }
-    out[n] = field_value(line, start, line.len(), first_quote, quotes)?;
+    out[n] = field_value(&line[start..])?;
     Some(out)
 }
 
 /// A field's value: a bare field is itself, a quoted field loses its wrapping
 /// quotes. Any other shape of quote usage makes the line malformed.
 #[inline]
-fn field_value<'a>(
-    line: &'a [u8],
-    start: usize,
-    end: usize,
-    first_quote: usize,
-    quotes: u32,
-) -> Option<&'a [u8]> {
-    match quotes {
-        0 => Some(&line[start..end]),
-        2 if first_quote == start && end - start >= 2 && line[end - 1] == b'"' => {
-            Some(&line[start + 1..end - 1])
+fn field_value(field: &[u8]) -> Option<&[u8]> {
+    let last = field.len().wrapping_sub(1);
+    match (field.first(), field.last()) {
+        (Some(b'"'), Some(b'"')) if field.len() >= 2 => {
+            let inner = &field[1..last];
+            if inner.iter().any(|&b| b == b'"') {
+                return None;
+            }
+            Some(inner)
         }
-        _ => None,
+        _ => {
+            if field.iter().any(|&b| b == b'"') {
+                return None;
+            }
+            Some(field)
+        }
     }
 }
 
