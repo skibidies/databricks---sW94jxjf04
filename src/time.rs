@@ -16,23 +16,12 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Days in each month, January first. February is bumped by a leap year.
+const MONTH_DAYS: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+#[inline]
 fn is_leap_year(year: i64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
 }
 
 fn two(s: &[u8], at: usize) -> Option<i64> {
@@ -71,7 +60,11 @@ fn civil_prefix(s: &[u8]) -> Option<i64> {
     if month < 1 || month > 12 {
         return None;
     }
-    if day < 1 || day > days_in_month(year, month) {
+    let mut month_days = MONTH_DAYS[month as usize];
+    if month == 2 && is_leap_year(year) {
+        month_days = 29;
+    }
+    if day < 1 || day > month_days {
         return None;
     }
     if hour > 23 || minute > 59 || second > 59 {
@@ -89,16 +82,19 @@ fn civil_prefix(s: &[u8]) -> Option<i64> {
 /// large for a 64-bit integer is outside every window, so it is None here; the
 /// rules call it "outside the window", which drops the row the same way.
 fn epoch_millis(s: &[u8]) -> Option<i64> {
-    let digits = match s.iter().position(|&c| c != b'0') {
-        None => return Some(0), // all zeros
-        Some(at) => &s[at..],
-    };
-    if digits.is_empty() || digits.len() > 19 {
-        return None;
-    }
+    // One pass: skip leading zeros, then accumulate, bailing out on anything
+    // that is not a digit or will not fit the value.
     let mut value: i64 = 0;
-    for &c in digits {
+    let mut significant = 0usize;
+    for &c in s {
         if !c.is_ascii_digit() {
+            return None;
+        }
+        if significant == 0 && c == b'0' {
+            continue;
+        }
+        significant += 1;
+        if significant > 19 {
             return None;
         }
         value = value * 10 + i64::from(c - b'0');
@@ -111,15 +107,15 @@ pub fn parse_timestamp(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    // F3 is digits only, and neither F1 nor F2 can be.
-    if s[0].is_ascii_digit() && s.iter().all(|c| c.is_ascii_digit()) {
-        return epoch_millis(s);
-    }
+    // F1 and F2 are exactly 20 and 25 bytes; anything else is either F3 or
+    // bad, so the shape is decided before any byte is scanned.
     match s.len() {
         // F1: 2026-10-03T23:58:10Z
         20 => {
+            // A 20-byte F3 with a leading zero is the only other thing this
+            // length can be.
             if s[19] != b'Z' {
-                return None;
+                return epoch_millis(s);
             }
             civil_prefix(s)
         }
@@ -128,10 +124,10 @@ pub fn parse_timestamp(s: &[u8]) -> Option<i64> {
             let sign = match s[19] {
                 b'+' => 1i64,
                 b'-' => -1,
-                _ => return None,
+                _ => return epoch_millis(s),
             };
             if s[22] != b':' {
-                return None;
+                return epoch_millis(s);
             }
             let hours = two(s, 20)?;
             let minutes = two(s, 23)?;
@@ -141,7 +137,7 @@ pub fn parse_timestamp(s: &[u8]) -> Option<i64> {
             let local = civil_prefix(s)?;
             Some(local - sign * (hours * HOUR + minutes * MINUTE))
         }
-        _ => None,
+        _ => epoch_millis(s),
     }
 }
 

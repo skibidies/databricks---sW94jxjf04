@@ -32,16 +32,16 @@ const BATCH: usize = 8 << 10;
 
 const NO_USER: u32 = u32::MAX;
 const NO_CAMPAIGN: u32 = u32::MAX;
-const NO_CAT: u32 = u32::MAX;
+const NO_CAT: u16 = u16::MAX;
 
 /// A parsed event line, as the event_id dedup keeps it.
 #[derive(Clone, Copy)]
 struct EvRow {
     ts: i64,     // i64::MIN when the ts is bad
     ingest: i64, // i64::MAX when the ingest_ts is bad
-    price: i64,  // -1 unless it is a purchase with a valid price
+    price: i32,  // -1 unless it is a purchase with a valid price
     user: u32,
-    cat: u32,
+    cat: u16,
     kind: u8,  // 0 view, 1 cart, 2 purchase, 255 anything else
     flags: u8, // bit 0: product_id is not empty
 }
@@ -77,8 +77,8 @@ struct CkRow {
 #[derive(Clone, Copy)]
 struct Ev2 {
     ts: i64,
-    price: i64,
-    cat: u32,
+    price: i32,
+    cat: u16,
     kind: u8,
 }
 
@@ -99,7 +99,7 @@ struct UserRow {
     sessions: i64,
     events: i64,
     revenue: i64,
-    top_cat: u32,
+    top_cat: u16,
 }
 
 /// products.csv and campaigns.csv: both clean, both small.
@@ -465,7 +465,7 @@ fn process_person(
     let mut day_sessions: i64 = 0;
     let mut day_events: i64 = 0;
     let mut day_revenue: i64 = 0;
-    let mut cat_sums: Vec<(u32, i64)> = Vec::new();
+    let mut cat_sums: Vec<(u16, i64)> = Vec::new();
 
     let mut lo = 0usize;
     let mut hi = 0usize;
@@ -506,10 +506,11 @@ fn process_person(
         for e in session {
             if e.kind == 2 {
                 purchasing = true;
-                revenue += e.price;
+                let price = i64::from(e.price);
+                revenue += price;
                 match cat_sums.iter_mut().find(|(cat, _)| *cat == e.cat) {
-                    Some((_, sum)) => *sum += e.price,
-                    None => cat_sums.push((e.cat, e.price)),
+                    Some((_, sum)) => *sum += price,
+                    None => cat_sums.push((e.cat, price)),
                 }
             }
         }
@@ -636,7 +637,7 @@ fn flush_day(
     sessions: i64,
     events: i64,
     revenue: i64,
-    cat_sums: &[(u32, i64)],
+    cat_sums: &[(u16, i64)],
 ) {
     let mut top = NO_CAT;
     let mut best: i64 = 0;
@@ -803,17 +804,17 @@ fn parse_events(data: &Path, catalog: &Catalog, users: &StrMap<u32>, events: &St
                         continue;
                     }
                     let (kind, price) = match f[4] {
-                        b"view" => (0u8, -1i64),
-                        b"cart" => (1, -1),
+                        b"view" => (0u8, -1i32),
+                        b"cart" => (1, -1i32),
                         b"purchase" => (2, parse_price(f[6])),
-                        _ => (255, -1),
+                        _ => (255, -1i32),
                     };
                     // Only purchases ever report a category, so only they pay
                     // for the product lookup.
                     let cat = if kind == 2 {
-                        catalog.product_cat.get(f[5]).unwrap_or(catalog.unknown)
+                        catalog.product_cat.get(f[5]).unwrap_or(catalog.unknown) as u16
                     } else {
-                        catalog.unknown
+                        catalog.unknown as u16
                     };
                     batch.rows.push(EvRow {
                         ts: time::parse_timestamp(f[2]).unwrap_or(i64::MIN),
@@ -990,7 +991,7 @@ fn parse_links(data: &Path, users: &StrMap<u32>) -> Vec<(u32, u32)> {
 
 /// A purchase's price: ASCII digits only, 1 to 10,000,000 (leading zeros fine).
 /// Anything else is -1, which is never a valid price.
-fn parse_price(field: &[u8]) -> i64 {
+fn parse_price(field: &[u8]) -> i32 {
     if field.is_empty() {
         return -1;
     }
@@ -1007,7 +1008,7 @@ fn parse_price(field: &[u8]) -> i64 {
     if value < 1 {
         -1
     } else {
-        value
+        value as i32
     }
 }
 
